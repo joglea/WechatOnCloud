@@ -24,6 +24,7 @@ import {
   userCanAccess,
   createInstance,
   removeInstance as removeInstanceRecord,
+  renameInstance,
   setInstanceUsers,
   publicInstance,
   type User,
@@ -38,6 +39,9 @@ import {
   triggerWechat,
   wechatStatus,
   instanceTarget,
+  uploadToInstance,
+  listInstanceFiles,
+  downloadFromInstance,
 } from './docker.js';
 import { createSession, getSession, destroySession, destroyUserSessions } from './sessions.js';
 
@@ -56,6 +60,8 @@ initStore();
 
 const app = Fastify({ logger: true, trustProxy: true });
 await app.register(cookie);
+// 文件上传走原始二进制（前端以 application/octet-stream 直传 File）
+app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
 
 // ---------- 鉴权辅助 ----------
 function currentUser(req: FastifyRequest): User | null {
@@ -245,6 +251,30 @@ app.delete('/api/admin/instances/:id', async (req, reply) => {
   return { ok: true };
 });
 
+// 重命名实例（仅管理员）：只改显示名，不动容器/卷。
+app.post('/api/admin/instances/:id/rename', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const { name } = (req.body as any) ?? {};
+  try {
+    return { instance: renameInstance((req.params as any).id, String(name ?? '')) };
+  } catch (e: any) {
+    return reply.code(400).send({ error: e.message });
+  }
+});
+
+// 启动/重启实例容器（仅管理员）：容器停止或被删后，一键拉起（不重建数据卷）。
+app.post('/api/admin/instances/:id/start', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const inst = findInstance((req.params as any).id);
+  if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  try {
+    await ensureRunning(inst);
+    return { ok: true };
+  } catch (e: any) {
+    return reply.code(500).send({ error: '启动失败：' + (e?.message || e) });
+  }
+});
+
 // 实例侧：设置该实例可被哪些账户访问
 app.post('/api/admin/instances/:id/users', async (req, reply) => {
   if (!requireAdmin(req, reply)) return;
@@ -255,6 +285,54 @@ app.post('/api/admin/instances/:id/users', async (req, reply) => {
     return { ok: true };
   } catch (e: any) {
     return reply.code(400).send({ error: e.message });
+  }
+});
+
+// ---------- 文件中转（有访问权限即可用；走面板鉴权，不额外暴露） ----------
+// 上传：原始二进制直传，落到实例 ~/Desktop，微信文件选择器可直接选到。
+app.post('/api/instances/:id/upload', { bodyLimit: 512 * 1024 * 1024 }, async (req, reply) => {
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  const id = (req.params as any).id;
+  if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
+  const name = String((req.query as any)?.name || '').trim();
+  const body = req.body as Buffer;
+  if (!Buffer.isBuffer(body) || body.length === 0) return reply.code(400).send({ error: '空文件或格式错误' });
+  try {
+    await uploadToInstance(findInstance(id)!, name, body);
+    return { ok: true };
+  } catch (e: any) {
+    return reply.code(400).send({ error: e?.message || '上传失败' });
+  }
+});
+
+// 列出可下载的中转文件
+app.get('/api/instances/:id/files', async (req, reply) => {
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  const id = (req.params as any).id;
+  if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
+  try {
+    return { files: await listInstanceFiles(findInstance(id)!) };
+  } catch {
+    return { files: [] };
+  }
+});
+
+// 下载某个中转文件
+app.get('/api/instances/:id/download', async (req, reply) => {
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  const id = (req.params as any).id;
+  if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
+  const name = String((req.query as any)?.name || '').trim();
+  try {
+    const buf = await downloadFromInstance(findInstance(id)!, name);
+    reply.header('content-type', 'application/octet-stream');
+    reply.header('content-disposition', `attachment; filename*=UTF-8''${encodeURIComponent(name)}`);
+    return reply.send(buf);
+  } catch (e: any) {
+    return reply.code(400).send({ error: e?.message || '下载失败' });
   }
 });
 

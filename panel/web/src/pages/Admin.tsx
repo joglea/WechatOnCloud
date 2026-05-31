@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api, type PanelUser, type InstanceWithStatus } from '../api';
+import { useUI, PasswordInput } from '../ui';
 
 export default function Admin() {
   const nav = useNavigate();
+  const { toast, confirm } = useUI();
   const [users, setUsers] = useState<PanelUser[]>([]);
   const [instances, setInstances] = useState<InstanceWithStatus[]>([]);
   const [err, setErr] = useState('');
@@ -11,6 +13,9 @@ export default function Admin() {
   const [creatingInst, setCreatingInst] = useState(false);
   const [assignInst, setAssignInst] = useState<InstanceWithStatus | null>(null); // 给实例选账户
   const [assignUser, setAssignUser] = useState<PanelUser | null>(null); // 给账户选实例
+  const [resetTarget, setResetTarget] = useState<PanelUser | null>(null); // 重置密码弹窗
+  const [deleteInst, setDeleteInst] = useState<InstanceWithStatus | null>(null); // 删除实例弹窗
+  const [renameInst, setRenameInst] = useState<InstanceWithStatus | null>(null); // 重命名实例弹窗
 
   const subs = users.filter((u) => u.role !== 'admin');
 
@@ -32,31 +37,23 @@ export default function Admin() {
   const usersForInstance = (id: string) => subs.filter((u) => u.allowedInstances.includes(id));
 
   const toggle = async (u: PanelUser) => {
-    await api.setDisabled(u.id, !u.disabled).catch((e) => alert(e.message));
-    load();
-  };
-  const reset = async (u: PanelUser) => {
-    const pw = prompt(`为 ${u.username} 设置新密码（至少 6 位）`);
-    if (!pw) return;
     try {
-      await api.resetUser(u.id, pw);
-      alert('已重置');
+      await api.setDisabled(u.id, !u.disabled);
+      toast(u.disabled ? '已启用' : '已禁用', 'ok');
     } catch (e: any) {
-      alert(e.message);
+      toast(e.message, 'error');
     }
+    load();
   };
   const removeUser = async (u: PanelUser) => {
-    if (!confirm(`确定删除子账号 ${u.username}？`)) return;
-    await api.deleteUser(u.id).catch((e) => alert(e.message));
-    load();
-  };
-  const removeInst = async (inst: InstanceWithStatus) => {
-    if (!confirm(`删除实例「${inst.name}」？容器会被移除，但聊天记录（数据卷）会保留。`)) return;
-    let purge = false;
-    if (confirm('是否同时永久删除该实例的聊天记录（数据卷）？此操作不可恢复。\n\n确定=连数据一起删，取消=仅删容器保留数据')) {
-      purge = true;
+    const ok = await confirm({ title: `删除子账号「${u.username}」？`, body: '该账户将无法再登录。', danger: true, confirmText: '删除' });
+    if (!ok) return;
+    try {
+      await api.deleteUser(u.id);
+      toast('已删除', 'ok');
+    } catch (e: any) {
+      toast(e.message, 'error');
     }
-    await api.deleteInstance(inst.id, purge).catch((e) => alert(e.message));
     load();
   };
 
@@ -88,10 +85,13 @@ export default function Admin() {
                 <span className="muted small">可访问账户 {usersForInstance(inst.id).length} 人</span>
               </div>
               <div className="user-actions">
+                <button className="btn-text" onClick={() => setRenameInst(inst)}>
+                  重命名
+                </button>
                 <button className="btn-text" onClick={() => setAssignInst(inst)}>
                   分配账户
                 </button>
-                <button className="btn-text danger" onClick={() => removeInst(inst)}>
+                <button className="btn-text danger" onClick={() => setDeleteInst(inst)}>
                   删除
                 </button>
               </div>
@@ -136,7 +136,7 @@ export default function Admin() {
                   <button className="btn-text" onClick={() => toggle(u)}>
                     {u.disabled ? '启用' : '禁用'}
                   </button>
-                  <button className="btn-text" onClick={() => reset(u)}>
+                  <button className="btn-text" onClick={() => setResetTarget(u)}>
                     重置密码
                   </button>
                   <button className="btn-text danger" onClick={() => removeUser(u)}>
@@ -191,6 +191,153 @@ export default function Admin() {
           }}
         />
       )}
+      {resetTarget && (
+        <ResetPassword
+          user={resetTarget}
+          onClose={() => setResetTarget(null)}
+          onDone={() => {
+            setResetTarget(null);
+            toast('密码已重置', 'ok');
+          }}
+        />
+      )}
+      {deleteInst && (
+        <DeleteInstance
+          inst={deleteInst}
+          onClose={() => setDeleteInst(null)}
+          onDone={() => {
+            setDeleteInst(null);
+            toast('实例已删除', 'ok');
+            load();
+          }}
+        />
+      )}
+      {renameInst && (
+        <RenameInstance
+          inst={renameInst}
+          onClose={() => setRenameInst(null)}
+          onDone={() => {
+            setRenameInst(null);
+            toast('已重命名', 'ok');
+            load();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function RenameInstance({ inst, onClose, onDone }: { inst: InstanceWithStatus; onClose: () => void; onDone: () => void }) {
+  const [name, setName] = useState(inst.name);
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErr('');
+    setBusy(true);
+    try {
+      await api.renameInstance(inst.id, name.trim());
+      onDone();
+    } catch (e: any) {
+      setErr(e.message || '重命名失败');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="modal-mask" onClick={onClose}>
+      <form className="card modal" onClick={(e) => e.stopPropagation()} onSubmit={submit}>
+        <h2>重命名实例</h2>
+        <input className="input" placeholder="实例名称" value={name} onChange={(e) => setName(e.target.value)} autoFocus />
+        {err && <div className="error">{err}</div>}
+        <div className="modal-actions">
+          <button type="button" className="btn" onClick={onClose}>
+            取消
+          </button>
+          <button className="btn btn-primary" disabled={busy || !name.trim() || name.trim() === inst.name}>
+            保存
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function ResetPassword({ user, onClose, onDone }: { user: PanelUser; onClose: () => void; onDone: () => void }) {
+  const [pw, setPw] = useState('');
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErr('');
+    setBusy(true);
+    try {
+      await api.resetUser(user.id, pw);
+      onDone();
+    } catch (e: any) {
+      setErr(e.message || '重置失败');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="modal-mask" onClick={onClose}>
+      <form className="card modal" onClick={(e) => e.stopPropagation()} onSubmit={submit}>
+        <h2>重置「{user.username}」的密码</h2>
+        <PasswordInput placeholder="新密码（至少 6 位）" autoComplete="new-password" value={pw} onChange={setPw} />
+        {err && <div className="error">{err}</div>}
+        <div className="modal-actions">
+          <button type="button" className="btn" onClick={onClose}>
+            取消
+          </button>
+          <button className="btn btn-primary" disabled={busy || pw.length < 6}>
+            重置
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function DeleteInstance({ inst, onClose, onDone }: { inst: InstanceWithStatus; onClose: () => void; onDone: () => void }) {
+  const [purge, setPurge] = useState(false);
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const submit = async () => {
+    setErr('');
+    setBusy(true);
+    try {
+      await api.deleteInstance(inst.id, purge);
+      onDone();
+    } catch (e: any) {
+      setErr(e.message || '删除失败');
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="modal-mask" onClick={onClose}>
+      <div className="card modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 360 }}>
+        <h2>删除实例「{inst.name}」？</h2>
+        <div className="muted" style={{ fontSize: 14, lineHeight: 1.5 }}>
+          容器会被移除。默认保留聊天记录（数据卷），之后可重建同名实例恢复。
+        </div>
+        <label className={'purge-opt' + (purge ? ' on' : '')} onClick={() => setPurge((v) => !v)}>
+          <span className="purge-check">{purge ? '✓' : ''}</span>
+          <span>
+            同时永久删除聊天记录（数据卷）
+            <span className="muted small" style={{ display: 'block' }}>不可恢复，请谨慎勾选</span>
+          </span>
+        </label>
+        {err && <div className="error">{err}</div>}
+        <div className="modal-actions">
+          <button type="button" className="btn" onClick={onClose}>
+            取消
+          </button>
+          <button type="button" className="btn btn-danger" disabled={busy} onClick={submit}>
+            {purge ? '连数据一起删除' : '删除实例'}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -257,7 +404,7 @@ function CreateUser({ instances, onClose, onDone }: { instances: InstanceWithSta
           value={username}
           onChange={(e) => setUsername(e.target.value)}
         />
-        <input className="input" type="password" placeholder="初始密码（至少 6 位）" value={password} onChange={(e) => setPassword(e.target.value)} />
+        <PasswordInput placeholder="初始密码（至少 6 位）" autoComplete="new-password" value={password} onChange={setPassword} />
         <div className="field-label">可访问的微信实例</div>
         <ChipMultiSelect
           options={instances.map((i) => ({ id: i.id, label: i.name }))}

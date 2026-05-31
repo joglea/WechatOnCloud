@@ -1,4 +1,5 @@
 import { hostname } from 'node:os';
+import { existsSync, readdirSync } from 'node:fs';
 import Docker from 'dockerode';
 import type { Instance } from './store.js';
 
@@ -28,6 +29,32 @@ export async function ensureNetwork(): Promise<string | null> {
     console.warn('[docker] 无法探测面板网络（本地开发或缺少 docker.sock 时正常）:', e?.message || e);
   }
   return networkName;
+}
+
+// 摄像头直通：把宿主的 v4l2 视频设备映射进实例容器
+// （浏览器摄像头 → KasmVNC → 容器内 /dev/videoN(v4l2loopback) → 微信）。
+// 来源优先级：
+//   1) WOC_VIDEO_DEVICES 显式指定（逗号分隔，如 /dev/video0,/dev/video1）——Ubuntu/无法自动探测时用；
+//   2) 自动探测：把宿主 /dev 以只读挂到面板的 /host-dev（compose 可选），扫描其中的 videoN。
+// 一个都找不到则返回空：音频/麦克风不受影响，仅摄像头不可用（优雅降级）。
+function videoDevices(): string[] {
+  const explicit = (process.env.WOC_VIDEO_DEVICES || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (explicit.length) return explicit;
+  for (const dir of ['/host-dev', '/dev']) {
+    try {
+      if (!existsSync(dir)) continue;
+      const vids = readdirSync(dir)
+        .filter((n) => /^video\d+$/.test(n))
+        .map((n) => `/dev/${n}`); // 宿主侧设备路径
+      if (vids.length) return vids;
+    } catch {
+      /* 无权限/不可读，忽略 */
+    }
+  }
+  return [];
 }
 
 function envList(inst: Instance): string[] {
@@ -62,19 +89,27 @@ export async function runInstance(inst: Instance): Promise<void> {
   } catch {
     /* 不存在，正常 */
   }
+  // 摄像头设备（探测不到则为空数组 → 仅摄像头不可用，音频/麦克风照常）
+  const vids = videoDevices();
+  const hostConfig: Docker.HostConfig = {
+    Binds: [`${inst.volumeName}:/config`],
+    NetworkMode: net || undefined,
+    SecurityOpt: ['seccomp=unconfined'],
+    ShmSize: SHM_SIZE,
+    RestartPolicy: { Name: 'unless-stopped' },
+  };
+  if (vids.length) {
+    hostConfig.Devices = vids.map((d) => ({ PathOnHost: d, PathInContainer: d, CgroupPermissions: 'rwm' }));
+    hostConfig.GroupAdd = ['video']; // 让容器内 abc 用户能访问 /dev/videoN
+    console.log(`[docker] 实例 ${inst.id} 挂载摄像头设备: ${vids.join(', ')}`);
+  }
   const container = await docker.createContainer({
     name: inst.containerName,
     Image: WECHAT_IMAGE,
     Hostname: inst.containerName,
     Env: envList(inst),
     ExposedPorts: { '3000/tcp': {} },
-    HostConfig: {
-      Binds: [`${inst.volumeName}:/config`],
-      NetworkMode: net || undefined,
-      SecurityOpt: ['seccomp=unconfined'],
-      ShmSize: SHM_SIZE,
-      RestartPolicy: { Name: 'unless-stopped' },
-    },
+    HostConfig: hostConfig,
   });
   await container.start();
 }
@@ -176,6 +211,79 @@ export async function pullImage(onProgress?: (line: any) => void): Promise<void>
       );
     });
   });
+}
+
+// ---------- 文件中转（上传/下载） ----------
+// 中转目录 = abc 家目录下的 Desktop（/config 持久卷）。上传落这里，微信文件选择器可直接选到；
+// 反向：把微信收到的文件另存到桌面，即可在面板里下载。
+const TRANSFER_DIR = '/config/Desktop';
+
+// 极简单文件 tar 编码（putArchive 需要 tar；避免引入第三方依赖）。
+function tarSingleFile(name: string, content: Buffer): Buffer {
+  const h = Buffer.alloc(512, 0);
+  h.write(name.slice(0, 100), 0, 'utf8'); // name
+  h.write('0000644\0', 100); // mode
+  h.write('0001750\0', 108); // uid 1000(octal 1750)
+  h.write('0001750\0', 116); // gid 1000
+  h.write(content.length.toString(8).padStart(11, '0') + '\0', 124); // size
+  h.write('00000000000\0', 136); // mtime
+  h.write('        ', 148); // checksum 占位（8 空格）
+  h.write('0', 156); // typeflag 普通文件
+  h.write('ustar\0', 257);
+  h.write('00', 263);
+  let sum = 0;
+  for (let i = 0; i < 512; i++) sum += h[i];
+  h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148); // 真实校验和
+  const pad = (512 - (content.length % 512)) % 512;
+  return Buffer.concat([h, content, Buffer.alloc(pad, 0), Buffer.alloc(1024, 0)]);
+}
+
+// 校验文件名为安全 basename（防路径穿越）。
+function safeName(name: string): boolean {
+  return !!name && name.length <= 200 && !name.includes('/') && !name.includes('\0') && name !== '.' && name !== '..';
+}
+
+export async function uploadToInstance(inst: Instance, name: string, content: Buffer): Promise<void> {
+  if (!safeName(name)) throw new Error('文件名不合法');
+  await execCapture(inst, ['sh', '-c', `mkdir -p ${TRANSFER_DIR}`]); // abc 家目录可写
+  const c = docker.getContainer(inst.containerName);
+  await c.putArchive(tarSingleFile(name, content), { path: TRANSFER_DIR });
+}
+
+export interface TransferFile {
+  name: string;
+  size: number;
+}
+export async function listInstanceFiles(inst: Instance): Promise<TransferFile[]> {
+  const out = await execCapture(inst, [
+    'sh',
+    '-c',
+    `find ${TRANSFER_DIR} -maxdepth 1 -type f -printf '%f\\t%s\\n' 2>/dev/null`,
+  ]);
+  return out
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => {
+      const [name, size] = line.split('\t');
+      return { name, size: Number(size) || 0 };
+    });
+}
+
+export async function downloadFromInstance(inst: Instance, name: string): Promise<Buffer> {
+  if (!safeName(name)) throw new Error('文件名不合法');
+  const c = docker.getContainer(inst.containerName);
+  const stream = (await c.getArchive({ path: `${TRANSFER_DIR}/${name}` })) as NodeJS.ReadableStream;
+  const chunks: Buffer[] = [];
+  await new Promise<void>((resolve, reject) => {
+    stream.on('data', (d: Buffer) => chunks.push(d));
+    stream.on('end', () => resolve());
+    stream.on('error', reject);
+  });
+  const tar = Buffer.concat(chunks);
+  if (tar.length < 512) return Buffer.alloc(0);
+  const sizeStr = tar.toString('ascii', 124, 135).replace(/\0/g, '').trim();
+  const size = parseInt(sizeStr, 8) || 0;
+  return tar.subarray(512, 512 + size);
 }
 
 // 实例容器名（供反代构造 target）。

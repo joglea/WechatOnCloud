@@ -1,16 +1,19 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth';
+import { useUI, PasswordInput } from '../ui';
 import { api, type InstanceWithStatus } from '../api';
 
 const BUSY_PHASES = ['downloading', 'extracting', 'installing'];
 
 export default function Dashboard() {
-  const { user, logout } = useAuth();
+  const { user, logout, refresh } = useAuth();
+  const { toast, confirm } = useUI();
   const nav = useNavigate();
   const [showPw, setShowPw] = useState(false);
   const [instances, setInstances] = useState<InstanceWithStatus[] | null>(null);
   const [err, setErr] = useState('');
+  const [starting, setStarting] = useState<Set<string>>(new Set());
   const timer = useRef<number | undefined>(undefined);
   const isAdmin = user?.role === 'admin';
 
@@ -48,8 +51,28 @@ export default function Dashboard() {
       );
       window.clearTimeout(timer.current);
       timer.current = window.setTimeout(load, 1000);
+      toast(kind === 'install' ? '已开始下载微信' : '已开始更新', 'ok');
     } catch (e: any) {
       setErr(e.message || '操作失败');
+      toast(e.message || '操作失败', 'error');
+    }
+  };
+
+  const start = async (inst: InstanceWithStatus) => {
+    setErr('');
+    setStarting((s) => new Set(s).add(inst.id));
+    try {
+      await api.instanceStart(inst.id);
+      toast('实例已启动', 'ok');
+      await load();
+    } catch (e: any) {
+      toast(e.message || '启动失败', 'error');
+    } finally {
+      setStarting((s) => {
+        const n = new Set(s);
+        n.delete(inst.id);
+        return n;
+      });
     }
   };
 
@@ -57,7 +80,12 @@ export default function Dashboard() {
     <div className="page">
       <header className="topbar">
         <span className="topbar-title">云微</span>
-        <button className="btn-text" onClick={() => logout()}>
+        <button
+          className="btn-text"
+          onClick={async () => {
+            if (await confirm({ title: '退出登录？', confirmText: '退出' })) logout();
+          }}
+        >
           退出
         </button>
       </header>
@@ -67,6 +95,16 @@ export default function Dashboard() {
           你好，<b>{user?.username}</b>
           {isAdmin && <span className="tag">管理员</span>}
         </div>
+
+        {user?.mustChangePassword && (
+          <button className="warn-banner" onClick={() => setShowPw(true)}>
+            <span className="warn-icon">!</span>
+            <span className="warn-text">
+              <b>你还在使用默认密码</b>
+              <span>该系统登录着你的微信，请立即修改密码 ›</span>
+            </span>
+          </button>
+        )}
 
         {err && <div className="error">{err}</div>}
 
@@ -81,7 +119,7 @@ export default function Dashboard() {
 
         {instances && instances.length === 0 && (
           <div className="empty-state">
-            <div className="empty-blob">📱</div>
+            <div className="empty-blob"><img src="/favicon.svg" alt="" /></div>
             <div className="empty-title">还没有微信实例</div>
             <div className="empty-sub">{isAdmin ? '去「管理」新建一个微信实例' : '请联系管理员为你分配实例'}</div>
           </div>
@@ -89,7 +127,15 @@ export default function Dashboard() {
 
         <div className="inst-grid">
           {instances?.map((inst) => (
-            <InstanceCard key={inst.id} inst={inst} isAdmin={isAdmin} onEnter={() => nav(`/desktop/${inst.id}`)} onTrigger={trigger} />
+            <InstanceCard
+              key={inst.id}
+              inst={inst}
+              isAdmin={isAdmin}
+              starting={starting.has(inst.id)}
+              onEnter={() => nav(`/desktop/${inst.id}`)}
+              onTrigger={trigger}
+              onStart={() => start(inst)}
+            />
           ))}
         </div>
 
@@ -107,7 +153,7 @@ export default function Dashboard() {
         </div>
       </main>
 
-      {showPw && <ChangePassword onClose={() => setShowPw(false)} />}
+      {showPw && <ChangePassword onClose={() => setShowPw(false)} onSaved={() => refresh()} />}
     </div>
   );
 }
@@ -115,13 +161,17 @@ export default function Dashboard() {
 function InstanceCard({
   inst,
   isAdmin,
+  starting,
   onEnter,
   onTrigger,
+  onStart,
 }: {
   inst: InstanceWithStatus;
   isAdmin?: boolean;
+  starting?: boolean;
   onEnter: () => void;
   onTrigger: (inst: InstanceWithStatus, kind: 'install' | 'update') => void;
+  onStart: () => void;
 }) {
   const wx = inst.wechat;
   const busy = BUSY_PHASES.includes(wx.phase);
@@ -135,7 +185,8 @@ function InstanceCard({
   else badge = { text: '待安装', cls: 'tag-warn' };
 
   let sub: string;
-  if (busy) sub = wx.percent >= 0 ? `${wx.message || '处理中'} ${wx.percent}%` : wx.message || '请稍候…';
+  if (offline) sub = inst.runtime === 'missing' ? '容器尚未创建' : '容器已停止，需先启动';
+  else if (busy) sub = wx.percent >= 0 ? `${wx.message || '处理中'} ${wx.percent}%` : wx.message || '请稍候…';
   else if (wx.phase === 'error') sub = wx.message || '操作失败，可重试';
   else if (installed) sub = wx.version ? `微信 ${wx.version}` : '微信已安装';
   else sub = '微信尚未安装';
@@ -160,9 +211,15 @@ function InstanceCard({
       )}
 
       <div className="inst-actions">
-        <button className="btn btn-primary inst-enter" disabled={!canEnter} onClick={onEnter}>
-          进入微信
-        </button>
+        {offline && isAdmin ? (
+          <button className="btn btn-primary inst-enter" disabled={starting} onClick={onStart}>
+            {starting ? '启动中…' : inst.runtime === 'missing' ? '创建并启动' : '启动实例'}
+          </button>
+        ) : (
+          <button className="btn btn-primary inst-enter" disabled={!canEnter} onClick={onEnter}>
+            进入微信
+          </button>
+        )}
         {isAdmin && !busy && !offline && (
           installed ? (
             <button className="btn inst-act" onClick={() => onTrigger(inst, 'update')}>
@@ -179,7 +236,7 @@ function InstanceCard({
   );
 }
 
-function ChangePassword({ onClose }: { onClose: () => void }) {
+function ChangePassword({ onClose, onSaved }: { onClose: () => void; onSaved?: () => void }) {
   const [oldPassword, setOld] = useState('');
   const [newPassword, setNew] = useState('');
   const [msg, setMsg] = useState('');
@@ -192,6 +249,7 @@ function ChangePassword({ onClose }: { onClose: () => void }) {
     try {
       await api.changePassword(oldPassword, newPassword);
       setMsg('修改成功');
+      onSaved?.(); // 刷新当前用户，清除「默认密码」提示
       setTimeout(onClose, 800);
     } catch (e: any) {
       setMsg(e.message || '修改失败');
@@ -204,8 +262,8 @@ function ChangePassword({ onClose }: { onClose: () => void }) {
     <div className="modal-mask" onClick={onClose}>
       <form className="card modal" onClick={(e) => e.stopPropagation()} onSubmit={submit}>
         <h2>修改密码</h2>
-        <input className="input" type="password" placeholder="原密码" value={oldPassword} onChange={(e) => setOld(e.target.value)} />
-        <input className="input" type="password" placeholder="新密码（至少 6 位）" value={newPassword} onChange={(e) => setNew(e.target.value)} />
+        <PasswordInput placeholder="原密码" autoComplete="current-password" value={oldPassword} onChange={setOld} />
+        <PasswordInput placeholder="新密码（至少 6 位）" autoComplete="new-password" value={newPassword} onChange={setNew} />
         {msg && <div className={msg === '修改成功' ? 'ok' : 'error'}>{msg}</div>}
         <div className="modal-actions">
           <button type="button" className="btn" onClick={onClose}>

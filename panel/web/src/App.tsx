@@ -1,5 +1,6 @@
 import { Navigate, Route, Routes } from 'react-router-dom';
 import { AuthProvider, useAuth } from './auth';
+import { UIProvider } from './ui';
 import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
 import Admin from './pages/Admin';
@@ -57,8 +58,10 @@ function Shell() {
 
 export default function App() {
   return (
-    <AuthProvider>
-      <Shell />
-    </AuthProvider>
+    <UIProvider>
+      <AuthProvider>
+        <Shell />
+      </AuthProvider>
+    </UIProvider>
   );
 }

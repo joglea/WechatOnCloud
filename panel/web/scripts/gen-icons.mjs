@@ -1,11 +1,14 @@
-// 生成 PWA / Apple 图标：微信绿圆角方块（纯前端依赖，无需外部工具）。
-// 想换成更精致的图标，直接用设计稿替换 public/icon-*.png 即可。
+// 生成 PWA / Apple 图标：绿底 macOS 终端风格（白色 `>_` 提示符 + 左上小圆点）。
+// 纯 Node 实现，无需外部工具（rsvg/imagemagick），保证本地 / Docker / CI 构建都产出一致图标。
+// 与 public/favicon.svg 同一视觉；改图标时两边一起改（坐标基于 100×100 视图）。
 import { deflateSync } from 'node:zlib';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-const COLOR = [7, 193, 96]; // #07C160
+const TOP = [0x13, 0xd8, 0x73]; // 顶部亮绿 #13D873
+const BOT = [0x05, 0xa8, 0x52]; // 底部深绿 #05A852
+const WHITE = [255, 255, 255];
 const OUT = join(dirname(fileURLToPath(import.meta.url)), '..', 'public');
 
 const CRC_TABLE = (() => {
@@ -33,34 +36,70 @@ function chunk(type, data) {
   return Buffer.concat([len, typeBuf, data, crc]);
 }
 
+// 点到线段距离（用于画带圆角端点的笔画）
+function distToSeg(px, py, ax, ay, bx, by) {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const len2 = dx * dx + dy * dy || 1;
+  let t = ((px - ax) * dx + (py - ay) * dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  const cx = ax + t * dx;
+  const cy = ay + t * dy;
+  return Math.hypot(px - cx, py - cy);
+}
+
+const clamp01 = (v) => Math.max(0, Math.min(1, v));
+
 function makePng(size) {
-  const radius = Math.round(size * 0.22);
+  const s = size / 100; // 视图 100 → 像素
+  const radius = 23 * s; // 圆角，与 favicon 一致
+  const stroke = (7.5 / 2) * s; // 笔画半宽
+  // 提示符坐标（基于 100 视图）
+  const chevron = [
+    [34, 30],
+    [48, 44],
+    [34, 58],
+  ].map(([x, y]) => [x * s, y * s]);
+  const underline = [
+    [56, 60],
+    [72, 60],
+  ].map(([x, y]) => [x * s, y * s]);
+  const dot = [22 * s, 36 * s, 3.4 * s]; // cx, cy, r
+
+  const inRounded = (x, y) => {
+    const r = radius;
+    const cx = x < r ? r : x > size - r ? size - r : x;
+    const cy = y < r ? r : y > size - r ? size - r : y;
+    if (cx === x && cy === y) return 1;
+    const d = Math.hypot(x - cx, y - cy);
+    return clamp01(r - d + 0.5); // 边缘 1px 抗锯齿
+  };
+
   const rowLen = size * 4 + 1;
   const raw = Buffer.alloc(rowLen * size);
-  const inRounded = (x, y) => {
-    // 圆角：四角之外的像素透明
-    const corners = [
-      [radius, radius],
-      [size - radius, radius],
-      [radius, size - radius],
-      [size - radius, size - radius],
-    ];
-    if ((x < radius || x >= size - radius) && (y < radius || y >= size - radius)) {
-      const cx = x < radius ? corners[0][0] : corners[1][0];
-      const cy = y < radius ? corners[0][1] : corners[2][1];
-      return (x - cx) ** 2 + (y - cy) ** 2 <= radius ** 2;
-    }
-    return true;
-  };
   for (let y = 0; y < size; y++) {
     raw[y * rowLen] = 0; // filter type 0
+    const gy = y + 0.5;
+    const mix = gy / size; // 竖直渐变系数
+    const bg = [
+      Math.round(TOP[0] + (BOT[0] - TOP[0]) * mix),
+      Math.round(TOP[1] + (BOT[1] - TOP[1]) * mix),
+      Math.round(TOP[2] + (BOT[2] - TOP[2]) * mix),
+    ];
     for (let x = 0; x < size; x++) {
+      const gx = x + 0.5;
+      // 白色提示符覆盖度（取各形状最大值）
+      let cov = 0;
+      cov = Math.max(cov, clamp01(stroke - distToSeg(gx, gy, chevron[0][0], chevron[0][1], chevron[1][0], chevron[1][1]) + 0.5));
+      cov = Math.max(cov, clamp01(stroke - distToSeg(gx, gy, chevron[1][0], chevron[1][1], chevron[2][0], chevron[2][1]) + 0.5));
+      cov = Math.max(cov, clamp01(stroke - distToSeg(gx, gy, underline[0][0], underline[0][1], underline[1][0], underline[1][1]) + 0.5));
+      cov = Math.max(cov, clamp01(dot[2] - Math.hypot(gx - dot[0], gy - dot[1]) + 0.5));
+
       const o = y * rowLen + 1 + x * 4;
-      const on = inRounded(x, y);
-      raw[o] = COLOR[0];
-      raw[o + 1] = COLOR[1];
-      raw[o + 2] = COLOR[2];
-      raw[o + 3] = on ? 255 : 0;
+      raw[o] = Math.round(bg[0] + (WHITE[0] - bg[0]) * cov);
+      raw[o + 1] = Math.round(bg[1] + (WHITE[1] - bg[1]) * cov);
+      raw[o + 2] = Math.round(bg[2] + (WHITE[2] - bg[2]) * cov);
+      raw[o + 3] = Math.round(255 * inRounded(gx, gy));
     }
   }
   const ihdr = Buffer.alloc(13);

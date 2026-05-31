@@ -5,6 +5,7 @@ export interface PanelUser {
   disabled: boolean;
   createdAt: string;
   allowedInstances: string[]; // admin 为空数组（隐式全部）
+  mustChangePassword?: boolean; // 仍在用默认密码时为 true
 }
 
 export type WechatPhase = 'idle' | 'downloading' | 'extracting' | 'installing' | 'done' | 'error';
@@ -38,7 +39,14 @@ async function req<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
     headers,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error((data as any).error || `请求失败 (${res.status})`);
+  if (!res.ok) {
+    // 会话过期：除登录/探测接口外，任意接口收到 401 都说明 cookie 失效，直接回登录页（避免页面卡在错误态）
+    const isAuthProbe = path.includes('/api/auth/login') || path.includes('/api/auth/me');
+    if (res.status === 401 && !isAuthProbe && location.pathname !== '/login') {
+      location.assign('/login');
+    }
+    throw new Error((data as any).error || `请求失败 (${res.status})`);
+  }
   return data as T;
 }
 
@@ -72,6 +80,8 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ name, allowedUserIds }),
     }),
+  renameInstance: (id: string, name: string) =>
+    req<{ instance: PanelInstance }>(`/api/admin/instances/${id}/rename`, { method: 'POST', body: JSON.stringify({ name }) }),
   deleteInstance: (id: string, purge = false) =>
     req(`/api/admin/instances/${id}${purge ? '?purge=1' : ''}`, { method: 'DELETE' }),
   setInstanceUsers: (id: string, userIds: string[]) =>
@@ -79,4 +89,19 @@ export const api = {
   instanceWechatStatus: (id: string) => req<{ status: WechatStatus }>(`/api/instances/${id}/wechat/status`),
   instanceWechatInstall: (id: string) => req(`/api/admin/instances/${id}/wechat/install`, { method: 'POST' }),
   instanceWechatUpdate: (id: string) => req(`/api/admin/instances/${id}/wechat/update`, { method: 'POST' }),
+  instanceStart: (id: string) => req(`/api/admin/instances/${id}/start`, { method: 'POST' }),
+
+  // 文件中转
+  listFiles: (id: string) => req<{ files: { name: string; size: number }[] }>(`/api/instances/${id}/files`),
+  uploadFile: async (id: string, file: File) => {
+    const res = await fetch(`/api/instances/${id}/upload?name=${encodeURIComponent(file.name)}`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: file,
+    });
+    if (!res.ok) throw new Error(((await res.json().catch(() => ({}))) as any).error || '上传失败');
+    return res.json();
+  },
+  downloadFileUrl: (id: string, name: string) => `/api/instances/${id}/download?name=${encodeURIComponent(name)}`,
 };

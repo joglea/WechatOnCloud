@@ -18,6 +18,9 @@ services:
       - PUID=${WOC_PUID:-1000}
       - PGID=${WOC_PGID:-1000}
       - TZ=${WOC_TZ:-Asia/Shanghai}
+      # 摄像头直通：逗号分隔的宿主视频设备（如 /dev/video0）。留空则自动探测（见下方 /host-dev 挂载）或禁用摄像头。
+      # 启用前需在宿主加载 v4l2loopback 内核模块。详见 .env.example。
+      - WOC_VIDEO_DEVICES=${WOC_VIDEO_DEVICES:-}
       # 面板首个管理员账号（仅首次启动、无账号文件时写入；务必改掉默认密码）
       - PANEL_ADMIN_USER=${WOC_USER:-admin}
       - PANEL_ADMIN_PASSWORD=${WOC_PASSWORD:-wechat}
@@ -29,6 +32,9 @@ services:
       # 面板经 docker 引擎创建/启动/删除微信实例容器、exec 触发下载、读取进度。
       # 注意：docker.sock 等同宿主 root 权限，故实例增删仅限管理员，docker API 绝不暴露给前端。
       - /var/run/docker.sock:/var/run/docker.sock
+      # 摄像头自动探测（可选）：把宿主 /dev 只读挂进来，面板据此发现 /dev/videoN 并映射给实例。
+      # 不想自动探测就删掉此行，改用上面的 WOC_VIDEO_DEVICES 显式指定。
+      - /dev:/host-dev:ro
 
     ports:
       - "${WOC_HTTP_PORT:-36080}:8080"   # 面板 = 唯一对外入口

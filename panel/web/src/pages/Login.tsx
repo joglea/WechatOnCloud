@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth';
+import { PasswordInput } from '../ui';
 
 export default function Login() {
   const { login } = useAuth();
@@ -40,13 +41,7 @@ export default function Login() {
           value={username}
           onChange={(e) => setUsername(e.target.value)}
         />
-        <input
-          className="input"
-          type="password"
-          placeholder="密码"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-        />
+        <PasswordInput placeholder="密码" autoComplete="current-password" value={password} onChange={setPassword} />
         {err && <div className="error">{err}</div>}
         <button className="btn btn-primary" disabled={busy || !username || !password}>
           {busy ? '登录中…' : '登录'}

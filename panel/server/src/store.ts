@@ -14,7 +14,12 @@ export interface User {
   createdAt: string;
   // 该账户可访问的微信实例 id 列表。admin 隐式全部，忽略此字段。
   allowedInstances: string[];
+  // 仍在使用初始默认密码时为 true，前端据此提示尽快改密；任意一次改密/重置后清除。
+  mustChangePassword?: boolean;
 }
+
+// 初始默认管理员密码；管理员仍在用它时强烈提示改密。
+const DEFAULT_ADMIN_PASSWORD = 'wechat';
 
 export interface Instance {
   id: string; // 短 id，用于容器/卷命名
@@ -68,9 +73,19 @@ export function initStore() {
   }
   if (!data.users.some((u) => u.role === 'admin')) {
     const username = process.env.PANEL_ADMIN_USER || 'admin';
-    const password = process.env.PANEL_ADMIN_PASSWORD || 'wechat';
-    data.users.push(makeUser(username, password, 'admin'));
+    const password = process.env.PANEL_ADMIN_PASSWORD || DEFAULT_ADMIN_PASSWORD;
+    const admin = makeUser(username, password, 'admin');
+    // 用默认密码初始化时标记，提醒尽快改密
+    if (password === DEFAULT_ADMIN_PASSWORD) admin.mustChangePassword = true;
+    data.users.push(admin);
     console.log(`[store] 已初始化管理员账号 '${username}'`);
+  } else {
+    // 兼容旧账号文件：管理员若仍能用默认密码登录，补打"需改密"标记
+    for (const u of data.users) {
+      if (u.role === 'admin' && u.mustChangePassword === undefined) {
+        u.mustChangePassword = bcrypt.compareSync(DEFAULT_ADMIN_PASSWORD, u.passwordHash);
+      }
+    }
   }
   persist();
 }
@@ -84,6 +99,7 @@ export function publicUser(u: User) {
     disabled: u.disabled,
     createdAt: u.createdAt,
     allowedInstances: u.role === 'admin' ? [] : u.allowedInstances,
+    mustChangePassword: !!u.mustChangePassword,
   };
 }
 
@@ -128,6 +144,7 @@ export function resetPassword(id: string, password: string) {
   const u = findById(id);
   if (!u) throw new Error('用户不存在');
   u.passwordHash = bcrypt.hashSync(password, 10);
+  u.mustChangePassword = false; // 改过密就不再提示
   persist();
   return publicUser(u);
 }
@@ -203,6 +220,16 @@ export function createInstance(name: string, createdBy: string, allowedUserIds: 
   }
   persist();
   return inst;
+}
+
+export function renameInstance(id: string, name: string) {
+  const inst = findInstance(id);
+  if (!inst) throw new Error('实例不存在');
+  const n = (name || '').trim();
+  if (!n || n.length > 30) throw new Error('实例名称为 1-30 个字符');
+  inst.name = n;
+  persist();
+  return publicInstance(inst);
 }
 
 export function removeInstance(id: string) {
