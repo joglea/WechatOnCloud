@@ -67,6 +67,13 @@ const app = Fastify({ logger: true, trustProxy: true });
 await app.register(cookie);
 // 文件上传走原始二进制（前端以 application/octet-stream 直传 File）
 app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
+// 兜底：cloudflared 等反代会把 bodyless POST 重写为 HTTP/2 + transfer-encoding: chunked，
+// 此时 Fastify 见 method=POST 又缺 Content-Type 会抛 415（Unsupported Media Type: undefined）。
+// 仅放行真正空体的请求，非空且未知类型仍拒。
+app.addContentTypeParser('*', { parseAs: 'buffer' }, (_req, body, done) => {
+  if (body.length === 0) return done(null, undefined);
+  done(new Error('Unsupported Media Type'), undefined);
+});
 
 // ---------- 鉴权辅助 ----------
 function currentUser(req: FastifyRequest): User | null {
